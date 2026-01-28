@@ -1,290 +1,453 @@
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import os
 import glob
-from tkinter import filedialog
+import threading
+import shutil # Para copiar arquivos de fonte
+from tkinter import filedialog, colorchooser
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES GLOBAIS ---
 PASTA_TEMAS = "temas_imagens"
-LARGURA_ORIGINAL = 800
-ALTURA_ORIGINAL = 400
+PASTA_FONTES = "minhas_fontes"
+LARGURA_BASE = 800
+ALTURA_BASE = 400
 
-# Cria a pasta se não existir
-if not os.path.exists(PASTA_TEMAS):
-    os.makedirs(PASTA_TEMAS)
+# Garante que as pastas existem
+for p in [PASTA_TEMAS, PASTA_FONTES]:
+    if not os.path.exists(p): os.makedirs(p)
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-class EditorEtiquetasPro(ctk.CTk):
+class AppEtiquetasV4(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Gerador de Etiquetas PRO - Por Adriano Ferreira Dev")
-        self.geometry("1280x720")
+        self.title("Gerador de Etiquetas Escolar - BY ADRIANO FERREIRA")
+        self.geometry("1300x850")
         
-        # Variáveis de Estado da Imagem
-        self.caminho_imagem_atual = None
-        self.imagem_base = None # A imagem original carregada
+        # --- ESTADO E VARIÁVEIS ---
+        self.img_original = None
         
-        # Variáveis de Ajuste (Encaixe)
-        self.zoom = 1.0
-        self.pos_x = 0
-        self.pos_y = 0
+        # Variáveis de Imagem (Background)
+        self.bg_zoom = 1.0
+        self.bg_offset_x = 0
+        self.bg_offset_y = 0
         
-        # Variáveis de Estilo
-        self.cor_texto = "#FFFFFF"
-        self.fonte_atual = "arialbd.ttf" # Tenta usar Arial Bold padrão
+        # Variáveis de Texto (Dicionário de Configuração)
+        # Aqui guardamos a posição e tamanho de CADA elemento separadamente
+        self.config_textos = {
+            "ALUNO":   {"x": 0, "y": -120, "size": 60, "color": "#FFFFFF", "font": "arialbd.ttf", "text": ""},
+            "MATÉRIA": {"x": 0, "y": 0,    "size": 90, "color": "#FFFFFF", "font": "arialbd.ttf", "text": "MATÉRIA"},
+            "TURMA":   {"x": 0, "y": 120,  "size": 50, "color": "#FFFFFF", "font": "arial.ttf",   "text": ""}
+        }
+        
+        self.elemento_selecionado = "ALUNO" # Qual texto estamos editando agora?
+        self.cor_sombra = "#000000"
+        
+        # UX (Arrastar Imagem)
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        
+        # OTIMIZAÇÃO
+        self.job_render = None 
 
         self.setup_ui()
         self.carregar_catalogo()
+        self.atualizar_lista_fontes()
 
     def setup_ui(self):
-        # Layout: Grid de 2 colunas principais (Controles/Galeria | Preview)
-        self.grid_columnconfigure(1, weight=3) # Lado do Preview maior
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # === PAINEL ESQUERDO (Controles e Galeria) ===
-        self.painel_esq = ctk.CTkFrame(self, width=350)
-        self.painel_esq.grid(row=0, column=0, sticky="nswe", padx=10, pady=10)
+        # === BARRA LATERAL ===
+        self.sidebar = ctk.CTkFrame(self, width=350, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
         
-        # 1. Dados do Aluno
-        ctk.CTkLabel(self.painel_esq, text="DADOS DA ETIQUETA", font=("Arial", 14, "bold")).pack(pady=5)
+        ctk.CTkLabel(self.sidebar, text="EDITOR STUDIO V4", font=("Roboto", 24, "bold")).pack(pady=20)
+
+        # Abas
+        self.tabview = ctk.CTkTabview(self.sidebar)
+        self.tabview.pack(padx=10, fill="both", expand=True)
         
-        self.entry_nome = ctk.CTkEntry(self.painel_esq, placeholder_text="Nome do Aluno")
-        self.entry_nome.pack(fill="x", padx=10, pady=5)
-        self.entry_nome.bind("<KeyRelease>", self.atualizar_preview) # Atualiza ao digitar
+        self.tab_dados = self.tabview.add("Dados")
+        self.tab_texto = self.tabview.add("Edição Texto") # NOVA ABA
+        self.tab_galeria = self.tabview.add("Galeria")
+
+        # --- ABA 1: DADOS ---
+        self.entry_nome = ctk.CTkEntry(self.tab_dados, placeholder_text="Nome do Aluno")
+        self.entry_nome.pack(fill="x", pady=10)
+        self.entry_nome.bind("<KeyRelease>", self.atualizar_texto_inputs)
+
+        self.entry_turma = ctk.CTkEntry(self.tab_dados, placeholder_text="Turma / Série")
+        self.entry_turma.pack(fill="x", pady=10)
+        self.entry_turma.bind("<KeyRelease>", self.atualizar_texto_inputs)
+
+        ctk.CTkLabel(self.tab_dados, text="Lista de Matérias:").pack(pady=(20,0))
+        self.txt_materias = ctk.CTkTextbox(self.tab_dados, height=200)
+        self.txt_materias.insert("0.0", "PORTUGUÊS\nMATEMÁTICA\nHISTÓRIA\nGEOGRAFIA\nCIÊNCIAS\nINGLÊS\nARTES")
+        self.txt_materias.pack(fill="x", pady=5)
+
+        # --- ABA 2: EDIÇÃO DE TEXTO (NOVIDADE) ---
+        ctk.CTkLabel(self.tab_texto, text="Selecione o elemento para editar:", font=("Arial", 12, "bold")).pack(pady=5)
         
-        self.entry_turma = ctk.CTkEntry(self.painel_esq, placeholder_text="Turma / Série")
-        self.entry_turma.pack(fill="x", padx=10, pady=5)
-        self.entry_turma.bind("<KeyRelease>", self.atualizar_preview)
+        # Seletor de qual texto editar
+        self.combo_elemento = ctk.CTkSegmentedButton(self.tab_texto, values=["ALUNO", "MATÉRIA", "TURMA"], command=self.mudar_elemento_foco)
+        self.combo_elemento.set("ALUNO")
+        self.combo_elemento.pack(fill="x", pady=5)
 
-        # 2. Configurações Visuais
-        ctk.CTkLabel(self.painel_esq, text="ESTILO DO TEXTO", font=("Arial", 12, "bold")).pack(pady=(15,5))
+        # Frame de Controles
+        self.frame_controles_texto = ctk.CTkFrame(self.tab_texto, fg_color="transparent")
+        self.frame_controles_texto.pack(fill="both", expand=True, pady=10)
+
+        # Sliders de Posição
+        ctk.CTkLabel(self.frame_controles_texto, text="Posição Vertical (Y)").pack()
+        self.slider_text_y = ctk.CTkSlider(self.frame_controles_texto, from_=-300, to=300, command=self.atualizar_params_texto)
+        self.slider_text_y.pack(fill="x", pady=5)
         
-        self.btn_cor = ctk.CTkSegmentedButton(self.painel_esq, values=["Branco", "Preto", "Amarelo", "Azul"], command=self.mudar_cor)
-        self.btn_cor.set("Branco")
-        self.btn_cor.pack(pady=5)
+        ctk.CTkLabel(self.frame_controles_texto, text="Posição Horizontal (X)").pack()
+        self.slider_text_x = ctk.CTkSlider(self.frame_controles_texto, from_=-400, to=400, command=self.atualizar_params_texto)
+        self.slider_text_x.pack(fill="x", pady=5)
 
-        # 3. Ajustes de Imagem (O "Encaixe")
-        ctk.CTkLabel(self.painel_esq, text="AJUSTE DE ENCAIXE (IMAGEM)", font=("Arial", 12, "bold")).pack(pady=(15,5))
+        # Tamanho da Fonte
+        ctk.CTkLabel(self.frame_controles_texto, text="Tamanho da Fonte").pack(pady=(15,0))
+        self.slider_font_size = ctk.CTkSlider(self.frame_controles_texto, from_=10, to=200, command=self.atualizar_params_texto)
+        self.slider_font_size.pack(fill="x", pady=5)
+
+        # Fontes e Cores
+        ctk.CTkLabel(self.frame_controles_texto, text="Estilo").pack(pady=(15,0))
+        self.combo_fontes = ctk.CTkComboBox(self.frame_controles_texto, values=[], command=self.mudar_fonte_atual)
+        self.combo_fontes.pack(fill="x", pady=5)
         
-        self.slider_zoom = ctk.CTkSlider(self.painel_esq, from_=0.5, to=3.0, command=self.atualizar_preview)
-        self.slider_zoom.set(1.0)
-        self.slider_zoom.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(self.painel_esq, text="Zoom", font=("Arial", 10)).pack()
+        self.btn_importar_fonte = ctk.CTkButton(self.frame_controles_texto, text="📥 Importar Nova Fonte", fg_color="#555", command=self.importar_fonte)
+        self.btn_importar_fonte.pack(fill="x", pady=5)
 
-        self.slider_x = ctk.CTkSlider(self.painel_esq, from_=-400, to=400, command=self.atualizar_preview)
-        self.slider_x.set(0)
-        self.slider_x.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(self.painel_esq, text="Mover Horizontal", font=("Arial", 10)).pack()
-
-        self.slider_y = ctk.CTkSlider(self.painel_esq, from_=-200, to=200, command=self.atualizar_preview)
-        self.slider_y.set(0)
-        self.slider_y.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(self.painel_esq, text="Mover Vertical", font=("Arial", 10)).pack()
-
-        # 4. Galeria e Upload
-        ctk.CTkLabel(self.painel_esq, text="SELECIONE O FUNDO", font=("Arial", 14, "bold")).pack(pady=(20,5))
+        self.btn_cor_texto = ctk.CTkButton(self.frame_controles_texto, text="🎨 Cor deste Texto", command=self.escolher_cor_texto)
+        self.btn_cor_texto.pack(fill="x", pady=10)
         
-        self.btn_upload = ctk.CTkButton(self.painel_esq, text="📂 Carregar Imagem do PC", fg_color="#E67E22", command=self.upload_imagem)
-        self.btn_upload.pack(fill="x", padx=10, pady=5)
+        self.btn_reset = ctk.CTkButton(self.frame_controles_texto, text="↺ Resetar Posição", fg_color="gray", command=self.resetar_posicao)
+        self.btn_reset.pack(fill="x", pady=5)
 
-        self.scroll_galeria = ctk.CTkScrollableFrame(self.painel_esq, label_text="Galeria de Personagens", height=200)
-        self.scroll_galeria.pack(fill="both", expand=True, padx=5, pady=5)
+        # --- ABA 3: GALERIA ---
+        self.btn_upload = ctk.CTkButton(self.tab_galeria, text="📂 Carregar Fundo", command=self.upload_imagem, fg_color="#E67E22")
+        self.btn_upload.pack(fill="x", pady=10)
+        self.scroll_imgs = ctk.CTkScrollableFrame(self.tab_galeria, label_text="Meus Temas")
+        self.scroll_imgs.pack(fill="both", expand=True)
 
-        # === PAINEL DIREITO (Preview e Ação) ===
-        self.painel_dir = ctk.CTkFrame(self)
-        self.painel_dir.grid(row=0, column=1, sticky="nswe", padx=10, pady=10)
+        # === ÁREA PRINCIPAL ===
+        self.main_area = ctk.CTkFrame(self)
+        self.main_area.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        
+        # Canvas Preview
+        self.canvas_preview = ctk.CTkCanvas(self.main_area, bg="#202020", highlightthickness=0)
+        self.canvas_preview.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Eventos do Canvas (Zoom e Drag da Imagem de Fundo)
+        self.canvas_preview.bind("<ButtonPress-1>", self.on_drag_start)
+        self.canvas_preview.bind("<B1-Motion>", self.on_drag_motion)
+        self.canvas_preview.bind("<MouseWheel>", self.on_zoom)
 
-        ctk.CTkLabel(self.painel_dir, text="PRÉ-VISUALIZAÇÃO EM TEMPO REAL", font=("Arial", 20)).pack(pady=20)
+        # Botão Gerar
+        self.btn_gerar = ctk.CTkButton(self.main_area, text="GERAR PDF FINAL", height=60, fg_color="#27AE60", font=("Arial", 18, "bold"), command=self.iniciar_geracao_pdf)
+        self.btn_gerar.pack(fill="x", pady=10)
+        
+        self.barra_progresso = ctk.CTkProgressBar(self.main_area)
+        self.barra_progresso.pack(fill="x", pady=(0, 10))
+        self.barra_progresso.pack_forget()
 
-        # Área da Imagem (Label que vai receber a foto)
-        self.lbl_preview = ctk.CTkLabel(self.painel_dir, text="Selecione um tema...", width=600, height=300, fg_color="gray20", corner_radius=10)
-        self.lbl_preview.pack(pady=20)
+        # Inicializa valores dos sliders
+        self.atualizar_controles_ui()
 
-        # Lista de Matérias para Impressão
-        ctk.CTkLabel(self.painel_dir, text="Matérias para Imprimir (Uma por linha):").pack()
-        self.txt_materias = ctk.CTkTextbox(self.painel_dir, height=100, width=400)
-        self.txt_materias.insert("0.0", "PORTUGUÊS\nMATEMÁTICA\nHISTÓRIA\nGEOGRAFIA\nCIÊNCIAS\nINGLÊS\nENS. RELIGIOSO\nARTES")
-        self.txt_materias.pack(pady=10)
+    # --- LÓGICA DE TEXTO V4 ---
 
-        self.btn_gerar = ctk.CTkButton(self.painel_dir, text="🖨️ GERAR PDF FINAL", font=("Arial", 18, "bold"), height=50, fg_color="#2ECC71", command=self.gerar_pdf)
-        self.btn_gerar.pack(pady=20)
+    def atualizar_texto_inputs(self, event=None):
+        """Atualiza o dicionário quando o usuário digita nos campos Nome/Turma"""
+        self.config_textos["ALUNO"]["text"] = self.entry_nome.get()
+        self.config_textos["TURMA"]["text"] = self.entry_turma.get()
+        self.agendar_render()
 
-    def mudar_cor(self, valor):
-        cores = {"Branco": "#FFFFFF", "Preto": "#000000", "Amarelo": "#F1C40F", "Azul": "#3498DB"}
-        self.cor_texto = cores[valor]
-        self.atualizar_preview()
+    def mudar_elemento_foco(self, valor):
+        """Quando o usuário troca a aba (Aluno -> Turma), atualiza os sliders para mostrar os valores daquele item"""
+        self.elemento_selecionado = valor
+        self.atualizar_controles_ui()
+
+    def atualizar_controles_ui(self):
+        """Pega os dados do dicionário e joga nos sliders"""
+        dados = self.config_textos[self.elemento_selecionado]
+        self.slider_text_x.set(dados["x"])
+        self.slider_text_y.set(dados["y"])
+        self.slider_font_size.set(dados["size"])
+        self.combo_fontes.set(dados["font"])
+        self.btn_cor_texto.configure(fg_color=dados["color"])
+
+    def atualizar_params_texto(self, event=None):
+        """Pega os dados dos sliders e joga no dicionário"""
+        elem = self.elemento_selecionado
+        self.config_textos[elem]["x"] = int(self.slider_text_x.get())
+        self.config_textos[elem]["y"] = int(self.slider_text_y.get())
+        self.config_textos[elem]["size"] = int(self.slider_font_size.get())
+        self.agendar_render()
+
+    def mudar_fonte_atual(self, escolha):
+        self.config_textos[self.elemento_selecionado]["font"] = escolha
+        self.agendar_render()
+
+    def escolher_cor_texto(self):
+        cor = colorchooser.askcolor(title=f"Cor para {self.elemento_selecionado}")[1]
+        if cor:
+            self.config_textos[self.elemento_selecionado]["color"] = cor
+            self.atualizar_controles_ui()
+            self.agendar_render()
+
+    def resetar_posicao(self):
+        """Volta o texto para o centro"""
+        defaults = {"ALUNO": -120, "MATÉRIA": 0, "TURMA": 120}
+        self.config_textos[self.elemento_selecionado]["x"] = 0
+        self.config_textos[self.elemento_selecionado]["y"] = defaults.get(self.elemento_selecionado, 0)
+        self.atualizar_controles_ui()
+        self.agendar_render()
+
+    # --- GERENCIAMENTO DE FONTES ---
+    
+    def atualizar_lista_fontes(self):
+        """Lê a pasta de fontes e atualiza o combobox"""
+        fontes = glob.glob(os.path.join(PASTA_FONTES, "*.ttf"))
+        nomes = [os.path.basename(f) for f in fontes]
+        
+        # Adiciona fontes padrão do sistema se não tiver nada
+        if not nomes:
+            nomes = ["arial.ttf", "arialbd.ttf"]
+        
+        self.combo_fontes.configure(values=nomes)
+        
+        # Garante que a fonte atual existe na lista
+        atual = self.config_textos[self.elemento_selecionado]["font"]
+        if atual not in nomes and nomes:
+            self.config_textos[self.elemento_selecionado]["font"] = nomes[0]
+
+    def importar_fonte(self):
+        """Copia um arquivo .ttf para a pasta do projeto"""
+        caminho = filedialog.askopenfilename(filetypes=[("Fontes TrueType", "*.ttf")])
+        if caminho:
+            try:
+                shutil.copy(caminho, PASTA_FONTES)
+                self.atualizar_lista_fontes()
+                
+                # Seleciona automaticamente a nova fonte
+                novo_nome = os.path.basename(caminho)
+                self.config_textos[self.elemento_selecionado]["font"] = novo_nome
+                self.atualizar_controles_ui()
+                self.agendar_render()
+                print(f"Fonte {novo_nome} importada com sucesso!")
+            except Exception as e:
+                print(f"Erro ao importar fonte: {e}")
+
+    # --- RENDERIZAÇÃO (ENGINE GRÁFICA) ---
+
+    def renderizar_preview(self, materia_exemplo="MATÉRIA"):
+        if not self.img_original: return
+
+        # 1. Base Transparente
+        base = Image.new("RGBA", (LARGURA_BASE, ALTURA_BASE), (0,0,0,0))
+        
+        # 2. Imagem de Fundo (Com Zoom e Drag)
+        w = int(self.img_original.width * self.bg_zoom)
+        h = int(self.img_original.height * self.bg_zoom)
+        
+        filtro = Image.Resampling.NEAREST if w > 3000 else Image.Resampling.LANCZOS
+        try:
+            img_resized = self.img_original.resize((w, h), filtro)
+        except: return 
+
+        # Centralização + Offset do usuário
+        x_bg = (LARGURA_BASE - w)//2 + self.bg_offset_x
+        y_bg = (ALTURA_BASE - h)//2 + self.bg_offset_y
+        base.paste(img_resized, (x_bg, y_bg))
+
+        # 3. Desenhar Textos (Iterando sobre a configuração)
+        draw = ImageDraw.Draw(base)
+        
+        for chave, dados in self.config_textos.items():
+            texto_final = dados["text"]
+            if not texto_final and chave == "ALUNO": texto_final = "NOME DO ALUNO"
+            if not texto_final and chave == "TURMA": texto_final = "TURMA / SÉRIE"
+            if chave == "MATÉRIA": texto_final = materia_exemplo # A matéria varia
+
+            self.desenhar_elemento_texto(draw, texto_final, dados)
+
+        # Borda de visualização
+        draw.rectangle([0,0, LARGURA_BASE-1, ALTURA_BASE-1], outline="white", width=2)
+
+        # 4. Exibir
+        self.exibir_no_canvas(base)
+
+    def desenhar_elemento_texto(self, draw, texto, dados):
+        """Desenha um único elemento baseado em seus dados (x, y, size, font)"""
+        texto = texto.upper()
+        tamanho = dados["size"]
+        
+        # Tenta carregar fonte
+        try:
+            caminho_fonte = os.path.join(PASTA_FONTES, dados["font"])
+            if os.path.exists(caminho_fonte):
+                font = ImageFont.truetype(caminho_fonte, tamanho)
+            else:
+                font = ImageFont.truetype("arialbd.ttf", tamanho) # Fallback
+        except:
+            font = ImageFont.load_default()
+
+        # Calcula posição: Centro da Imagem + Offset do Usuário
+        bbox = draw.textbbox((0, 0), texto, font=font)
+        w_text = bbox[2] - bbox[0]
+        h_text = bbox[3] - bbox[1]
+        
+        x_centro = (LARGURA_BASE - w_text) // 2
+        y_centro = (ALTURA_BASE - h_text) // 2 # Centralização vertical base
+        
+        x_final = x_centro + dados["x"]
+        y_final = y_centro + dados["y"]
+
+        # Sombra (Contraste)
+        cor_principal = dados["color"]
+        # Define cor da sombra automática
+        cor_sombra = "#000000" if cor_principal.lower() > "#aaaaaa" else "#FFFFFF"
+        
+        adj = 3 # Espessura sombra
+        for dx in range(-adj, adj+1):
+            for dy in range(-adj, adj+1):
+                if dx != 0 or dy != 0:
+                    draw.text((x_final+dx, y_final+dy), texto, font=font, fill=cor_sombra)
+        
+        draw.text((x_final, y_final), texto, font=font, fill=cor_principal)
+
+    def exibir_no_canvas(self, pil_image):
+        """Ajusta a imagem para caber no canvas da tela"""
+        canvas_w = self.canvas_preview.winfo_width()
+        canvas_h = self.canvas_preview.winfo_height()
+        if canvas_w < 10: canvas_w = 600
+        if canvas_h < 10: canvas_h = 300
+
+        ratio = min(canvas_w/LARGURA_BASE, canvas_h/ALTURA_BASE)
+        new_w = int(LARGURA_BASE * ratio) - 20
+        new_h = int(ALTURA_BASE * ratio) - 20
+        
+        img_display = pil_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        self.tk_image = ImageTk.PhotoImage(img_display)
+        
+        self.canvas_preview.delete("all")
+        self.canvas_preview.create_image(canvas_w//2, canvas_h//2, image=self.tk_image)
+
+    # --- LÓGICA DE EVENTOS (AGENDAR RENDER) ---
+    def agendar_render(self, event=None, delay=200):
+        if self.job_render: self.after_cancel(self.job_render)
+        self.job_render = self.after(delay, lambda: self.renderizar_preview("MATÉRIA"))
+
+    def on_drag_start(self, event):
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+
+    def on_drag_motion(self, event):
+        dx = event.x - self.drag_start_x
+        dy = event.y - self.drag_start_y
+        self.bg_offset_x += dx
+        self.bg_offset_y += dy
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+        self.agendar_render(delay=10)
+
+    def on_zoom(self, event):
+        fator = 1.1 if (event.num == 4 or event.delta > 0) else 0.9
+        self.bg_zoom *= fator
+        self.agendar_render(delay=50)
+
+    # --- UPLOAD E CATALOGO ---
+    def upload_imagem(self):
+        path = filedialog.askopenfilename(filetypes=[("Imagens", "*.png;*.jpg;*.jpeg")])
+        if path: self.carregar_imagem_base(path)
+
+    def carregar_imagem_base(self, path):
+        try:
+            self.img_original = Image.open(path).convert("RGBA")
+            self.bg_zoom = 1.0
+            self.bg_offset_x = 0
+            self.bg_offset_y = 0
+            self.agendar_render()
+        except Exception as e: print(e)
 
     def carregar_catalogo(self):
-        # Limpa galeria
-        for w in self.scroll_galeria.winfo_children(): w.destroy()
-        
-        # Busca imagens
-        extensoes = ['*.jpg', '*.jpeg', '*.png']
-        arquivos = []
-        for ext in extensoes:
-            arquivos.extend(glob.glob(os.path.join(PASTA_TEMAS, ext)))
-            
-        # Adiciona botões na galeria
-        for arq in arquivos:
-            nome = os.path.basename(arq)
-            btn = ctk.CTkButton(self.scroll_galeria, text=nome[:15], command=lambda p=arq: self.selecionar_tema(p), fg_color="gray30")
-            btn.pack(pady=2, fill="x")
+        for w in self.scroll_imgs.winfo_children(): w.destroy()
+        imgs = glob.glob(os.path.join(PASTA_TEMAS, "*.jpg")) + glob.glob(os.path.join(PASTA_TEMAS, "*.png"))
+        for path in imgs:
+            try:
+                pil = Image.open(path); pil.thumbnail((100,50))
+                ctk_img = ctk.CTkImage(pil, size=(100,50))
+                ctk.CTkButton(self.scroll_imgs, text=os.path.basename(path)[:10], image=ctk_img, compound="top", 
+                              fg_color="transparent", command=lambda p=path: self.carregar_imagem_base(p)).pack(pady=5, fill="x")
+            except: pass
 
-    def upload_imagem(self):
-        caminho = filedialog.askopenfilename(filetypes=[("Imagens", "*.jpg;*.png;*.jpeg")])
-        if caminho:
-            self.selecionar_tema(caminho)
+    # --- GERAÇÃO PDF ---
+    def iniciar_geracao_pdf(self):
+        if not self.img_original: return
+        self.barra_progresso.pack(fill="x"); self.barra_progresso.start()
+        self.btn_gerar.configure(state="disabled")
+        threading.Thread(target=self.processar_pdf).start()
 
-    def selecionar_tema(self, caminho):
-        self.caminho_imagem_atual = caminho
-        try:
-            self.imagem_base = Image.open(caminho).convert("RGBA")
-            # Reseta os ajustes ao trocar de imagem
-            self.slider_zoom.set(1.0)
-            self.slider_x.set(0)
-            self.slider_y.set(0)
-            self.atualizar_preview()
-        except Exception as e:
-            print(f"Erro ao carregar imagem: {e}")
-
-    def renderizar_etiqueta(self, materia_texto="MATÉRIA EXEMPLO"):
-        """Motor gráfico que cria a imagem final"""
-        if not self.imagem_base:
-            return None
-
-        # 1. Cria base da etiqueta (800x400)
-        img_final = Image.new("RGBA", (LARGURA_ORIGINAL, ALTURA_ORIGINAL), (0,0,0,0))
-        
-        # 2. Aplica Transformações (Zoom e Posição - Encaixe)
-        # Calcula novo tamanho com base no zoom
-        w_novo = int(self.imagem_base.width * self.slider_zoom.get())
-        h_novo = int(self.imagem_base.height * self.slider_zoom.get())
-        img_redimensionada = self.imagem_base.resize((w_novo, h_novo), Image.Resampling.LANCZOS)
-        
-        # Calcula posição centralizada + deslocamento dos sliders
-        x_centro = (LARGURA_ORIGINAL - w_novo) // 2 + int(self.slider_x.get())
-        y_centro = (ALTURA_ORIGINAL - h_novo) // 2 + int(self.slider_y.get())
-        
-        # Cola a imagem redimensionada na base da etiqueta (cropando o que sobrar)
-        img_final.paste(img_redimensionada, (x_centro, y_centro))
-        
-        # 3. Desenha os Textos
-        draw = ImageDraw.Draw(img_final)
-        
-        try:
-            # Tenta fontes do sistema, senão fallback
-            font_nome = ImageFont.truetype("arialbd.ttf", 60)
-            font_mat = ImageFont.truetype("arialbd.ttf", 90)
-            font_turma = ImageFont.truetype("arial.ttf", 50)
-        except:
-            font_nome = ImageFont.load_default()
-            font_mat = ImageFont.load_default()
-            font_turma = ImageFont.load_default()
-
-        # Cores
-        cor_fill = self.cor_texto
-        # Sombra oposta para contraste (se texto branco, sombra preta)
-        cor_shadow = "black" if cor_fill == "#FFFFFF" or cor_fill == "#F1C40F" else "white"
-
-        def draw_text_centered(text, font, y):
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_w = bbox[2] - bbox[0]
-            x = (LARGURA_ORIGINAL - text_w) // 2
-            
-            # Desenha contorno grosso (Stroke) para legibilidade perfeita
-            adj = 3
-            for dx in [-adj, 0, adj]:
-                for dy in [-adj, 0, adj]:
-                    draw.text((x+dx, y+dy), text, font=font, fill=cor_shadow)
-            
-            draw.text((x, y), text, font=font, fill=cor_fill)
-
-        nome = self.entry_nome.get() or "NOME DO ALUNO"
-        turma = self.entry_turma.get() or "TURMA"
-        
-        draw_text_centered(nome.upper(), font_nome, 40)
-        draw_text_centered(materia_texto.upper(), font_mat, 140)
-        draw_text_centered(turma.upper(), font_turma, 280)
-        
-        # 4. Moldura de acabamento
-        draw.rectangle([10, 10, LARGURA_ORIGINAL-10, ALTURA_ORIGINAL-10], outline=cor_shadow, width=5)
-        draw.rectangle([15, 15, LARGURA_ORIGINAL-15, ALTURA_ORIGINAL-15], outline=cor_fill, width=3)
-
-        return img_final
-
-    def atualizar_preview(self, event=None):
-        if not self.imagem_base: return
-
-        # Renderiza com uma matéria de exemplo para visualizar
-        img = self.renderizar_etiqueta("MATEMÁTICA")
-        
-        # Converte para exibir na tela (CTkImage)
-        # Reduz um pouco para caber na interface sem distorcer
-        preview_size = (500, 250)
-        img_preview = ctk.CTkImage(img, size=preview_size)
-        
-        self.lbl_preview.configure(image=img_preview, text="")
-
-    def gerar_pdf(self):
-        if not self.imagem_base: return
-        
+    def processar_pdf(self):
         materias = self.txt_materias.get("0.0", "end").strip().split('\n')
-        if not materias: return
-
-        filename = f"Etiquetas_{self.entry_nome.get() or 'Escola'}.pdf"
+        filename = f"Etiquetas_Custom_{self.entry_nome.get() or 'Aluno'}.pdf"
         
-        # Configuração do PDF ReportLab
         c = canvas.Canvas(filename, pagesize=A4)
-        width_a4, height_a4 = A4
+        w_pdf, h_pdf = 90*mm, 45*mm
         
-        # Grid: 2 colunas, várias linhas
-        w_etiqueta_pdf = 90 * mm
-        h_etiqueta_pdf = 45 * mm
-        margem_x = 10 * mm
-        margem_y = height_a4 - 55 * mm
-        
-        col = 0
-        
-        print("Gerando PDF...")
-        for mat in materias:
-            if not mat.strip(): continue
+        # Renderização Interna (Replicar lógica visual)
+        for i, mat in enumerate(materias):
+            if not mat: continue
             
-            # 1. Renderiza a etiqueta para essa matéria específica
-            pil_image = self.renderizar_etiqueta(mat)
+            # Recria a imagem em memória (Full Resolution)
+            base = Image.new("RGBA", (LARGURA_BASE, ALTURA_BASE), (0,0,0,0))
+            w = int(self.img_original.width * self.bg_zoom)
+            h = int(self.img_original.height * self.bg_zoom)
+            try: img_res = self.img_original.resize((w, h), Image.Resampling.LANCZOS)
+            except: img_res = self.img_original
             
-            # 2. Salva temp
-            temp_file = f"temp_{mat}.png"
-            pil_image.save(temp_file)
+            x = (LARGURA_BASE - w)//2 + self.bg_offset_x
+            y = (ALTURA_BASE - h)//2 + self.bg_offset_y
+            base.paste(img_res, (x, y))
             
-            # 3. Desenha no PDF
-            x_pos = margem_x + (col * (w_etiqueta_pdf + 5*mm))
-            c.drawImage(temp_file, x_pos, margem_y, width=w_etiqueta_pdf, height=h_etiqueta_pdf)
+            draw = ImageDraw.Draw(base)
             
-            # Limpa temp
-            os.remove(temp_file)
+            # Desenha cada texto configurado
+            for chave, dados in self.config_textos.items():
+                txt = dados["text"]
+                if chave == "ALUNO" and not txt: txt = "ALUNO"
+                if chave == "TURMA" and not txt: txt = "TURMA"
+                if chave == "MATÉRIA": txt = mat
+                self.desenhar_elemento_texto(draw, txt, dados)
+
+            draw.rectangle([0,0, LARGURA_BASE-1, ALTURA_BASE-1], outline="black", width=2)
             
-            # Lógica de Posição
-            col += 1
-            if col > 1: # Mudança de linha
-                col = 0
-                margem_y -= (h_etiqueta_pdf + 5*mm)
-                
-            # Nova página se encher
-            if margem_y < 10*mm:
-                c.showPage()
-                margem_y = height_a4 - 55 * mm
-                col = 0
+            temp = f"temp_{i}.png"
+            base.save(temp)
+            
+            # Posição no PDF
+            col = i % 2
+            row = (i // 2) % 6
+            x_pos = 10*mm + (col * (w_pdf + 5*mm))
+            y_pos = 297*mm - 20*mm - ((row+1) * (h_pdf + 5*mm))
+            
+            c.drawImage(temp, x_pos, y_pos, width=w_pdf, height=h_pdf)
+            os.remove(temp)
+            
+            if col == 1 and row == 5: c.showPage()
         
         c.save()
-        os.startfile(filename) # Abre o PDF (Windows)
-        print(f"Sucesso! Arquivo {filename} gerado.")
+        os.startfile(filename)
+        self.barra_progresso.stop(); self.barra_progresso.pack_forget()
+        self.btn_gerar.configure(state="normal")
 
 if __name__ == "__main__":
-    app = EditorEtiquetasPro()
+    app = AppEtiquetasV4()
     app.mainloop()
